@@ -1,6 +1,9 @@
+import sys
 import math
 import numpy as np
 import tensorflow as tf
+
+import matplotlib.pyplot as plt
 
 from tensorflow.keras import Model, Sequential
 from tensorflow.keras.layers import Layer, InputLayer, Multiply, Lambda, Flatten, Dense, Conv2D, Conv2DTranspose
@@ -31,7 +34,7 @@ def runtime_coef(kernel_size, gain, fmaps_in, fmaps_out, lrmul=1.0):
 
 def pixel_norm(x, epsilon=1e-8):
     epsilon = tf.constant(epsilon, dtype=x.dtype, name='epsilon')
-    return x * tf.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + epsilon)
+    return x * tf.math.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + epsilon)
 
 class PixelNorm(Layer):
     def __init__(self, name):
@@ -50,7 +53,7 @@ class InstanceNorm(Layer):
         x = tf.cast(x, tf.float32)
         x -= tf.reduce_mean(x, axis=[2,3], keepdims=True)
         epsilon = tf.constant(epsilon, dtype=x.dtype, name='epsilon')
-        x *= tf.rsqrt(tf.reduce_mean(tf.square(x), axis=[2,3], keepdims=True) + epsilon)
+        x *= tf.math.rsqrt(tf.reduce_mean(tf.square(x), axis=[2,3], keepdims=True) + epsilon)
         x = tf.cast(x, orig_dtype)
         return x
     
@@ -88,10 +91,10 @@ class DenseLayer(Dense):
         self.lrmul = lrmul
     
     def call(self, inputs):
-        x, b, w = inputs, self.bias * self.lrmul, self.kernel * runtime_coef([1,1], self.gain, inputs.shape[1].value, self.units, lrmul=self.lrmul)
+        x, b, w = inputs, self.bias * self.lrmul, self.kernel * runtime_coef([1,1], self.gain, inputs.shape[1], self.units, lrmul=self.lrmul)
         
         # Input x kernel
-        if len(x.shape) > 2: x = tf.reshape(x, [-1, np.prod([d.value for d in x.shape[1:]])])
+        if len(x.shape) > 2: x = tf.reshape(x, [-1, np.prod([d for d in x.shape[1:]])])
         x = tf.matmul(x, w)
         
         # Bias
@@ -115,7 +118,7 @@ class Conv2d(Conv2D):
         else:
             w = self.kernel_modifier(self.kernel)
             
-        outputs = self._convolution_op(inputs, w * runtime_coef(self.kernel_size, self.gain, inputs.shape[1].value, self.filters))
+        outputs = self._convolution_op(inputs, w * runtime_coef(self.kernel_size, self.gain, inputs.shape[1], self.filters))
         
         if self.use_bias:
             b = self.bias * self.lrmul        
@@ -151,17 +154,19 @@ class RandomNoise(Layer):
         return self.noise
     
 class ApplyNoise(Layer):
-    def __init__(self, name):
+    def __init__(self, name, is_const_noise):
         super(ApplyNoise, self).__init__(name=name)        
+        self.is_const_noise = is_const_noise
 
     def build(self, input_shape):
         input_shape = input_shape[0]
-        self.weight = self.add_variable('weight', shape=[input_shape[1].value], initializer=tf.initializers.zeros())
+        self.weight = self.add_variable('weight', shape=[input_shape[1]], initializer=tf.initializers.zeros())
         
-    def call(self, inputs):        
-        #noise = tf.random_normal([tf.shape(x)[0], 1, x.shape[2], x.shape[3]], dtype=x.dtype)
+    def call(self, inputs):
         x, noise = inputs
-        
+        if not self.is_const_noise:
+            noise = tf.random.normal([tf.shape(x)[0], 1, x.shape[2], x.shape[3]], dtype=x.dtype)
+
         return x + noise * tf.reshape(self.weight, [1, -1, 1, 1])
     
 class ApplyBias(Layer):
@@ -170,7 +175,7 @@ class ApplyBias(Layer):
         self.lrmul = lrmul
         
     def build(self, input_shape):
-        self.bias = self.add_variable('bias', shape=[input_shape[1].value])
+        self.bias = self.add_variable('bias', shape=[input_shape[1]])
         
     def call(self, x):
         b = self.bias * self.lrmul
@@ -196,7 +201,7 @@ class StyleModApply(Layer):
         return x * (style[:,0] + 1) + style[:,1]
 
 def _blur2d(x, f=[1,2,1], normalize=True, flip=False, stride=1):
-    assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
+    assert x.shape.ndims == 4 and all(dim is not None for dim in x.shape[1:])
     assert isinstance(stride, int) and stride >= 1
 
     # Finalize filter kernel.
@@ -230,7 +235,7 @@ def Blur(name, blur_filter=[1,2,1]):
     return Lambda(lambda x: blur2d(x, blur_filter), name=name)
 
 def _downscale2d(x, factor=2, gain=1):
-    assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
+    assert x.shape.ndims == 4 and all(dim is not None for dim in x.shape[1:])
     assert isinstance(factor, int) and factor >= 1
 
     # 2x2, float32 => downscale using _blur2d().
@@ -252,7 +257,7 @@ def _downscale2d(x, factor=2, gain=1):
     return tf.nn.avg_pool(x, ksize=ksize, strides=ksize, padding='VALID', data_format='NCHW')
 
 def _upscale2d(x, factor=2, gain=1):
-    assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
+    assert x.shape.ndims == 4 and all(dim is not None for dim in x.shape[1:])
     assert isinstance(factor, int) and factor >= 1
 
     # Apply gain.
@@ -314,7 +319,7 @@ class Conv2d_transpose(Conv2DTranspose):
         self.kernel_modifier = kernel_modifier
         
     def build(self, input_shape):
-        shape = [self.kernel_size[0], self.kernel_size[1], input_shape[1].value, self.filters]
+        shape = [self.kernel_size[0], self.kernel_size[1], input_shape[1], self.filters]
         self.kernel = self.add_variable('weight', shape=shape, initializer=tf.initializers.zeros())
             
     def call(self, inputs):
@@ -325,7 +330,7 @@ class Conv2d_transpose(Conv2DTranspose):
             w = tf.add_n([w[1:, 1:], w[:-1, 1:], w[1:, :-1], w[:-1, :-1]])
             return w
 
-        x, w = inputs, fused_op(self.kernel * runtime_coef(self.kernel_size, self.gain, inputs.shape[1].value, self.filters, lrmul=self.lrmul))
+        x, w = inputs, fused_op(self.kernel * runtime_coef(self.kernel_size, self.gain, inputs.shape[1], self.filters, lrmul=self.lrmul))
         
         os = [tf.shape(inputs)[0], self.filters, inputs.shape[2] * 2, inputs.shape[3] * 2]
         
@@ -333,8 +338,31 @@ class Conv2d_transpose(Conv2DTranspose):
         
         return outputs
 
+
+class MinibatchStddevLayer(tf.keras.layers.Layer):
+    def __init__(self, group_size =4, num_new_features=1):
+        super().__init__()
+        self.group_size = group_size
+        self.num_new_features = num_new_features
+
+    def __call__(self, x, *args, **kwargs):
+        group_size = tf.minimum(self.group_size,
+                                tf.shape(x)[0])  # Minibatch must be divisible by (or smaller than) group_size.
+        s = x.shape  # [NCHW]  Input shape.
+        y = tf.reshape(x, [group_size, -1, self.num_new_features, s[1] // self.num_new_features, s[2], s[
+            3]])  # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c.
+        y = tf.cast(y, tf.float32)  # [GMncHW] Cast to FP32.
+        y -= tf.reduce_mean(y, axis=0, keepdims=True)  # [GMncHW] Subtract mean over group.
+        y = tf.reduce_mean(tf.square(y), axis=0)  # [MncHW]  Calc variance over group.
+        y = tf.sqrt(y + 1e-8)  # [MncHW]  Calc stddev over group.
+        y = tf.reduce_mean(y, axis=[2, 3, 4], keepdims=True)  # [Mn111]  Take average over fmaps and pixels.
+        y = tf.reduce_mean(y, axis=[2])  # [Mn11] Split channels into c channel groups
+        y = tf.cast(y, x.dtype)  # [Mn11]  Cast back to original data type.
+        y = tf.tile(y, [group_size, 1, s[2], s[3]])  # [NnHW]  Replicate over group and pixels.
+        return tf.concat([x, y], axis=1)  # [NCHW]  Append as new fmap.
+
 def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
-    with tf.variable_scope('MinibatchStddev'):
+    with tf.compat.v1.variable_scope('MinibatchStddev'):
         group_size = tf.minimum(group_size, tf.shape(x)[0])     # Minibatch must be divisible by (or smaller than) group_size.
         s = x.shape                                             # [NCHW]  Input shape.
         y = tf.reshape(x, [group_size, -1, num_new_features, s[1]//num_new_features, s[2], s[3]])   # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c.
@@ -348,7 +376,8 @@ def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
         y = tf.tile(y, [group_size, 1, s[2], s[3]])             # [NnHW]  Replicate over group and pixels.
         return tf.concat([x, y], axis=1)                        # [NCHW]  Append as new fmap.
 		
-def StyleGAN_G_mapping( latent_size=512, dlatent_size=512, mapping_layers=8, mapping_fmaps=512, mapping_lrmul=0.01 ):
+def StyleGAN_G_mapping( latent_size=512, dlatent_size=512, mapping_layers=8, mapping_fmaps=512, mapping_lrmul=0.01,
+                        truncation_psi=1 ):
     model = Sequential(name='G_mapping')
     model.add( InputLayer(input_shape=[latent_size], name='G_mapping/latents_in') ) 
 
@@ -368,13 +397,13 @@ def StyleGAN_G_mapping( latent_size=512, dlatent_size=512, mapping_layers=8, map
     
     # Output.
     model.add( Identity(name='G_mapping/dlatents_out') )
-    
+
     # Apply truncation trick.
-    model.add( Truncation(name='Truncation') )
+    model.add( Truncation(name='Truncation'), truncation_psi=1 )
     
     return model
 
-def StyleGAN_G_synthesis(dlatent_size=512, resolution=1024):
+def StyleGAN_G_synthesis(dlatent_size=512, resolution=1024, is_const_noise=True):
     # General parameters
     num_channels = 3
     resolution_log2 = int(np.log2(resolution))
@@ -393,7 +422,7 @@ def StyleGAN_G_synthesis(dlatent_size=512, resolution=1024):
     def layer_epilogue(x, layer_idx, name):
         name = 'G_synthesis/{}x{}/{}/'.format(x.shape[2], x.shape[2], name)
         
-        x = ApplyNoise(name=name+'Noise')([x, noise_inputs[layer_idx]])        
+        x = ApplyNoise(name=name+'Noise', is_const_noise=is_const_noise)([x, noise_inputs[layer_idx]])
         x = ApplyBias(name=name+'bias')(x)
         x = LeakyReLU(alpha=0.2, name=name+'LeakyReLU')(x)
         x = InstanceNorm(name=name+'InstanceNorm')(x)       
@@ -429,13 +458,18 @@ def StyleGAN_G_synthesis(dlatent_size=512, resolution=1024):
         x = block(res, x)
             
     x = torgb(resolution_log2, x)
-    
+
+    # change output to the default NHWC format
+    x = tf.transpose(x, (0, 2, 3, 1))
+
     return Model(inputs=dlatents_in, outputs=x, name='G_synthesis')
-    
+
+
 class StyleGAN_G(Model):
-    def __init__(self, resolution=1024, latent_size=512, dlatent_size=512, mapping_layers=8, mapping_fmaps=512, mapping_lrmul=0.01 ):
+    def __init__(self, resolution=1024, latent_size=512, dlatent_size=512, mapping_layers=8, mapping_fmaps=512,
+                 mapping_lrmul=0.01, truncation_psi=1):
         super(StyleGAN_G, self).__init__()
-        self.model_mapping = StyleGAN_G_mapping(latent_size, dlatent_size, mapping_layers, mapping_fmaps, mapping_lrmul)
+        self.model_mapping = StyleGAN_G_mapping(latent_size, dlatent_size, mapping_layers, mapping_fmaps, mapping_lrmul, truncation_psi)
         self.model_synthesis = StyleGAN_G_synthesis(dlatent_size, resolution)
         print('Model created.')
         
@@ -453,15 +487,13 @@ class StyleGAN_G(Model):
         images = y.transpose([0, 2, 3, 1])
         images = np.clip((images+1)*0.5, 0, 1)
         
+        # print(images.shape, np.min(images), np.max(images))
+
+        plt.figure(figsize=(10, 10))
+        plt.imshow(images[0])
         if is_visualize:
-            print(images.shape, np.min(images), np.max(images))
-
-            import matplotlib.pyplot as plt
-
-            plt.figure(figsize=(10,10))
-            plt.imshow(images[0])
             plt.show()
-        
+
         return images
     
 class StyleGAN_D(Model):
@@ -509,12 +541,14 @@ class StyleGAN_D(Model):
         self.model = model
 
     def call(self, inputs):
+        inputs = tf.transpose(inputs, (0, 3, 1, 2))
         return self.model(inputs)
 
 def copy_weights_to_keras_model(model, all_weights):
     c = 0
     od = all_weights
     for l in model.layers:
+      try:
         values = l.get_weights()
         weights = list(map(lambda x: x.shape, values))
         if not len(weights): continue
@@ -569,5 +603,8 @@ def copy_weights_to_keras_model(model, all_weights):
                 c = c + num_params
             else:
                 print('WARNING: not found', var_names)
+      except Exception as e:
+          print(e)
+          print('skipping...')
 
     print('Total number of parameters copied:', c)
